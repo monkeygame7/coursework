@@ -1,0 +1,222 @@
+/* 
+ * Creates two NxN matrix filled with junk data and multiplies them.
+ * Uses MPI to split the matrices across a number of nodes.
+ * Each node uses pthreads to parallelize the multiplication on each node.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include <mpi.h>
+#include <pthread.h>
+#include <semaphore.h>
+
+/*
+	Called by each process, does all the multiplication and message passing
+ */
+void ring_multiply(double *a, double *b, double *c, int my_n);
+
+/*
+	does the actual multiplication
+ */
+void multiply(double *a, double *b, double *c, int my_n, int row, int start, int end);
+
+/*
+	calculates the 2d index as 1d
+ */
+int get_index(int i, int j);
+
+/*
+	the function called by each thread, waits for 
+ */
+void *thread_func(void* params);
+
+int myid, numprocs, n, numthreads;
+sem_t sem;
+pthread_barrier_t barrier;
+
+typedef struct parameters{
+	double **a;
+	double *b;
+	double *c;
+	int my_n;
+	int threadnum;
+} thread_params;
+
+int main(int argc, char ** argv) {
+	double *my_a, *my_b, *my_c, *A, *B, *C;
+	double start_time, end_time, delta, max_time;
+	int my_n, i;
+	
+	if(argc != 3) {
+		printf("Usage: %s <matrix_size> <num_threads>\n", argv[0]);
+		exit(1);
+	}
+
+	n = strtol(argv[1], NULL, 10);
+	if (n < 1) {
+		perror("Matrix must be at least size of 1\n");
+		exit(1);
+	}
+	
+	numthreads = strtol(argv[2], NULL, 10);
+	if (n < 1) {
+		perror("Need at least 1 thread\n");
+		exit(1);
+	}
+	
+	
+	MPI_Init(&argc,&argv);
+	MPI_Comm_size(MPI_COMM_WORLD,&numprocs);
+	MPI_Comm_rank(MPI_COMM_WORLD,&myid);
+	
+	my_n = n / numprocs; //size of each proc's block, assumes n is evenly divisible by numprocs
+	my_a = malloc((my_n*n) * sizeof(double));
+	my_b = malloc((my_n*n) * sizeof(double));
+	my_c = malloc((my_n*n) * sizeof(double));
+	
+	for (i=0; i<(my_n*n); i++) //initialize all c to 0
+		my_c[i] = 0;
+	
+	/* process 0 distributes data */
+	if (myid == 0) {
+		A = malloc((n*n) * sizeof(double));
+		B = malloc((n*n) * sizeof(double));
+		C = malloc((n*n) * sizeof(double));
+	}
+
+	/* format of data being sent is not exactly correct, but seeing as how the data is
+	   junk anyway I saw no harm.  In an actual implementation the data would be stored in
+	   the array such that scatter would give each node it's relevant data*/
+	MPI_Scatter(A, (my_n*n), MPI_DOUBLE, my_a, (my_n*n), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Scatter(B, (my_n*n), MPI_DOUBLE, my_b, (my_n*n), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	//begin timing
+	MPI_Barrier(MPI_COMM_WORLD);
+	start_time = MPI_Wtime();
+	ring_multiply(my_a, my_b, my_c, my_n);
+
+	MPI_Gather(my_c, (my_n*n), MPI_DOUBLE, C, (my_n*n), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+	//finish timing
+	end_time = MPI_Wtime();
+	delta = end_time - start_time;
+	
+	MPI_Reduce(&delta, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+	free(my_a);
+	free(my_b);
+	free(my_c);
+	if (myid == 0) {
+		printf("1C: size = %d, numprocs = %d, threads = %d, time taken: %f\n", n, numprocs, numthreads, max_time);
+		free(A);
+		free(B);
+		free(C);
+	}
+	MPI_Finalize();
+	
+	return 0;
+}
+
+void ring_multiply(double *a, double *b, double *c, int my_n) {
+	MPI_Status status;
+	MPI_Request send_request, recv_request;
+	double *recv_buf = malloc((my_n*n)*sizeof(double));
+	double *temp_a = a;
+	double *p; //used for swapping buffers
+	int right = (myid+1)%numprocs;
+	int left = myid - 1;
+	if (left < 0) left = numprocs - 1; //wrap around
+	int j, i;
+	pthread_t* thread_handles = malloc(numthreads*sizeof(pthread_t));
+	thread_params *params;
+	int thread;
+	//initalize the semaphore and barrier
+	sem_init(&sem, 0, 0);
+	pthread_barrier_init(&barrier, NULL, numthreads+1); //add one for current thread synchronization
+	
+	//create worker threads
+	for (thread=0; thread<numthreads; thread++) {
+		//build params
+		params = malloc(sizeof(thread_params));
+		params->a = &temp_a;
+		params->b = b;
+		params->c = c;
+		params->my_n = my_n;
+		params->threadnum = thread;
+		pthread_create(&thread_handles[thread], NULL, thread_func, params);
+	}
+	
+	//initially starts both requests as complete
+	MPI_Isend(recv_buf, 1, MPI_DOUBLE, myid, 0, MPI_COMM_WORLD, &send_request);
+	MPI_Irecv(recv_buf, 1, MPI_DOUBLE, myid, 0, MPI_COMM_WORLD, &recv_request);
+	 
+	for (i=0, j=myid; i < numprocs; i++, j = (j+1)%numprocs) {
+		//make sure it has recieved data to work with
+		MPI_Wait(&recv_request, &status);
+		//try sending so next proc can start using if possible
+		MPI_Isend(temp_a, (my_n*n), MPI_DOUBLE, left, 0, MPI_COMM_WORLD, &send_request);
+		
+		//notify threads to continue
+		for (thread=0; thread<numthreads; thread++) {
+			sem_post(&sem);
+		}
+		
+		//wait for threads to complete current iteration
+		pthread_barrier_wait(&barrier);
+		
+		//try recieving the next one
+		MPI_Irecv(recv_buf, (my_n*n), MPI_DOUBLE, right, 0, MPI_COMM_WORLD, &recv_request);
+		//wait till buffer finished sending before overwriting
+		MPI_Wait(&send_request, &status);
+		/* now temp_a will be pointing to the recieve buffer and the recieve buffer will be what is being sent */
+		p = temp_a;
+		temp_a = recv_buf;
+		recv_buf = p;
+	}
+	
+	//destroy worker threads
+	for (thread=0; thread<numthreads; thread++)
+		pthread_join(thread_handles[thread], NULL);
+	//destroy sem and barrier
+	sem_destroy(&sem);
+	pthread_barrier_destroy(&barrier);
+}
+
+void *thread_func(void* params) {
+	thread_params *p = (thread_params *)params;
+	double **a = p->a;
+	double *b = p->b;
+	double *c = p->c;
+	int my_n = p->my_n;
+	int threadnum = p->threadnum;
+	int block_size = my_n / numthreads; //assumes even division
+	int first = threadnum * block_size;
+	int last = (threadnum+1) * block_size;
+	int i, j;
+	
+	
+	for (i=0, j=myid; i < numprocs; i++, j = (j+1)%numprocs) {
+		sem_wait(&sem); //waits for a to become available
+		multiply(*a, b, c, my_n, j*my_n, first, last);
+		pthread_barrier_wait(&barrier);
+	}
+	
+	//destroy params
+	free(params);
+	return NULL;
+}
+
+void multiply(double *a, double *b, double *c, int my_n, int row, int start, int end) {
+	int i, j, k;
+	
+	for (i=start; i<end; i++) {
+		for (j=0; j<my_n; j++) {
+			for (k=0; k<my_n; k++) {
+				c[get_index(i,j)] += a[get_index(i,k)] * b[get_index(k+row,j)];
+			}
+		}
+	}
+}
+
+int get_index(int i, int j) {
+	int my_n = n/numprocs;
+	return (i*my_n) + j;
+}
