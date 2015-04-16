@@ -1,4 +1,6 @@
 /* File:      histogram.c
+ * A program that generates a bunch of random data and stores them in different bins.
+ * It then displays the data as a histogram
  * The methods that I wrote are main, thread_func, and barrier.
  * The rest was provided by the instructor.
  */
